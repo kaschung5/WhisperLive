@@ -1,7 +1,8 @@
 import os
 import shutil
 import wave
-
+import av
+from pathlib import Path
 import logging
 import numpy as np
 import pyaudio
@@ -151,7 +152,7 @@ class Client:
         
         if self.log_transcription:
             # Truncate to last 3 entries for brevity.
-            text = text[-3:]
+            text = text[-1:]
             utils.clear_screen()
             utils.print_transcript(text)
 
@@ -513,20 +514,28 @@ class TranscriptionTeeClient:
         if not audio_stream:
             print(f"[ERROR]: No audio stream found in {stream_type} source.")
             return
+        
+        resampler = av.AudioResampler(format='s16', layout='mono', rate=self.rate)
 
+        save_file = 'recording.wav'
+        resampled_file = Path(save_file).stem + "_resampled.wav"
         output_container = None
         if save_file:
-            output_container = av.open(save_file, mode="w")
-            output_audio_stream = output_container.add_stream(codec_name="pcm_s16le", rate=self.rate)
+            output_container = av.open(resampled_file, mode="w")
+            output_audio_stream = output_container.add_stream(codec_name="pcm_s16le", rate=self.rate, layout='mono')
 
         try:
-            for packet in container.demux(audio_stream):
-                for frame in packet.decode():
-                    audio_data = frame.to_ndarray().tobytes()
-                    self.multicast_packet(audio_data)
-
-                    if save_file:
-                        output_container.mux(frame)
+            for frame in container.decode(audio=0):
+                frame.pts = None
+                resampled_frames = resampler.resample(frame)
+                if resampled_frames is not None:
+                    for resampled_frame in resampled_frames:
+                        for packet in output_audio_stream.encode(resampled_frame):
+                            output_container.mux(packet)
+            for packet in output_audio_stream.encode(None):
+                output_container.mux(packet)
+            output_container.close()
+            self.play_file(resampled_file)
         except Exception as e:
             print(f"[ERROR]: Error during {stream_type} stream processing: {e}")
         finally:
