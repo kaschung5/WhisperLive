@@ -511,40 +511,41 @@ class TranscriptionTeeClient:
             save_file (str, optional): Local path to save the stream. Default is None.
         """
         audio_stream = next((s for s in container.streams if s.type == "audio"), None)
+        
         if not audio_stream:
             print(f"[ERROR]: No audio stream found in {stream_type} source.")
             return
         
+        self.stream = self.p.open(
+                format=self.p.get_format_from_width(2),
+                channels=1,
+                rate=16000,
+                input=True,
+                output=True,
+                frames_per_buffer=4096,
+            )
+
         resampler = av.AudioResampler(format='s16', layout='mono', rate=self.rate)
-
-        save_file = 'recording.wav'
-        resampled_file = Path(save_file).stem + "_resampled.wav"
-        output_container = None
-        if save_file:
-            output_container = av.open(resampled_file, mode="w")
-            output_audio_stream = output_container.add_stream(codec_name="pcm_s16le", rate=self.rate, layout='mono')
-
-        try:
-            for frame in container.decode(audio=0):
-                frame.pts = None
-                resampled_frames = resampler.resample(frame)
-                if resampled_frames is not None:
-                    for resampled_frame in resampled_frames:
-                        for packet in output_audio_stream.encode(resampled_frame):
-                            output_container.mux(packet)
-            for packet in output_audio_stream.encode(None):
-                output_container.mux(packet)
-            output_container.close()
-            self.play_file(resampled_file)
-        except Exception as e:
-            print(f"[ERROR]: Error during {stream_type} stream processing: {e}")
-        finally:
-            # Wait for server to send any leftover transcription.
-            time.sleep(5)
-            self.multicast_packet(Client.END_OF_AUDIO.encode('utf-8'), True)
-            if output_container:
-                output_container.close()
-            container.close()
+        
+        buffer = b""
+        total_frames = 0
+        for frame in container.decode(audio=0):
+            resampled_frames = resampler.resample(frame)
+            for resampled_frame in resampled_frames:
+                audio_data = resampled_frame.to_ndarray().tobytes()
+                buffer += audio_data
+                total_frames += len(audio_data)
+                while total_frames >= self.chunk:
+                    bytes_to_send = buffer[:self.chunk]
+                    self.multicast_packet(self.bytes_to_float_array(bytes_to_send).tobytes())
+                    self.stream.write(bytes_to_send)
+                    buffer = buffer[self.chunk:]
+                    total_frames = 0
+    
+        if self.stream:
+            self.stream.close()
+        self.multicast_packet(Client.END_OF_AUDIO.encode('utf-8'), True)
+        container.close()
 
     def save_chunk(self, n_audio_file):
         """
